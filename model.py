@@ -322,7 +322,7 @@ class Model:
         try:
             self.hand_log.extend(actions)
             action = self._decide(game_state)
-            if type(action) is not PlayerAction:
+            if not isinstance(action, PlayerAction):
                 raise TypeError("_decide must return a PlayerAction")
             game_state.validate_action(action)  # InvalidAction if illegal
             return action
