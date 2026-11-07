@@ -97,6 +97,51 @@ MIX_MARGIN = 0.03
 # far ahead of the range that calls (no bluffs).
 STATION_MIN_EQUITY = 0.5
 
+# ---------------------------------------------------------------------------
+# Phase 5: fold rates learned per bet size
+# ---------------------------------------------------------------------------
+#
+# Many bots fold by a pot-odds cut-off: they call every small bet and fold
+# to every big one. One fold-to-bet number cannot show that, so the
+# profiler also counts folds per bet size (the bet as a share of the pot
+# before it). Each is a Beta posterior whose prior is what the bot
+# assumed before (the size-scaled fold_to_bet), worth FOLD_PRIOR hands:
+# with little data the bot plays as it did, the data takes over.
+SIZE_EDGES = (0.45, 0.8, 1.3)  # small | medium | large | huge
+FOLD_PRIOR = 5.0
+# Sizes we have fewer than EXPLORE_MIN answers for are tried now and then
+# (EXPLORE_P of our bets), only among sizes the EV says beat checking.
+EXPLORE_MIN = 8
+EXPLORE_P = 0.2
+# Opponents adapt (a bot that sees us bet more starts calling more), so
+# each new answer at a size shrinks the older ones there by FOLD_DECAY:
+# the counts remember about the last 1 / (1 - FOLD_DECAY) answers.
+FOLD_DECAY = 0.97
+LEARNED_FOLDS = ("b0", "b1", "b2", "b3")
+# Opening hands outside the chart is considered only against a known
+# opponent who folds to steals at least this often.
+WIDEN_FTS = 0.6
+# Not learned, on purpose: folds to our preflop all-ins (tried as a raw
+# rate, a ratio and a log-odds shift vs our prediction) and folds to our
+# raises of their bets. Each cost 5-12 bb/100 heads-up against the
+# baseline bot, which adapts: it tightens when we shove or raise more, so
+# what we learned went stale. See gauntlet.py.
+
+
+def size_bucket(frac: float) -> int:
+    """0 small, 1 medium, 2 large, 3 huge: a bet of frac x the pot."""
+    for k, edge in enumerate(SIZE_EDGES):
+        if frac < edge:
+            return k
+    return len(SIZE_EDGES)
+
+
+def learned(hits_chances, prior: float) -> float:
+    """A fold rate: the prior worth FOLD_PRIOR observations, plus data."""
+    hits, chances = hits_chances
+    rate = (hits + prior * FOLD_PRIOR) / (chances + FOLD_PRIOR)
+    return min(0.98, max(0.0, rate))
+
 
 class OutOfTime(Exception):
     """Raised by a checkpoint once run() has used DEADLINE_S."""
@@ -376,10 +421,12 @@ class Model:
         return self._bet_or_check(gs, prof, cols, street, width, realize, ip)
 
     def _fold_share(self, prof, size_frac: float) -> float:
-        """How often they fold to a bet of size_frac x pot: their
-        fold-to-bet, more against bigger bets."""
+        """How often they fold to a bet of size_frac x pot: what they did
+        against bets of that size, from a prior of their fold-to-bet,
+        more against bigger bets."""
         f = min(0.95, max(0.02, prof["fold_to_bet"]))
-        return min(0.95, f * (0.7 + 0.45 * size_frac))
+        prior = min(0.95, f * (0.7 + 0.45 * size_frac))
+        return learned(prof["fold_sizes"][size_bucket(size_frac)], prior)
 
     def _bet_or_check(self, gs, prof, cols, street, width, realize, ip):
         """Nothing owed: the best of checking and each bet size.
@@ -412,6 +459,7 @@ class Model:
         if jam <= 1.5 * pot:
             sizes.append(jam)
         best_ev, best_size = None, None
+        good = []  # sizes that beat checking
         for b in sizes:
             self._tick()
             b = min(b, jam)
@@ -423,12 +471,21 @@ class Model:
                 continue  # never bluff a station
             r = 1.0 if (street == 2 or b >= jam) else realize
             ev = fold * pot + (1 - fold) * (r * eq_called * (pot + 2 * b) - b)
+            if ev >= ev_check:
+                good.append(b)
             if best_ev is None or ev > best_ev:
                 best_ev, best_size = ev, b
         if best_ev is None or best_ev < ev_check - MIX_MARGIN * pot:
             return PlayerAction.call(me)  # check
         if best_ev < ev_check + MIX_MARGIN * pot and self.rng.random() < 0.5:
             return PlayerAction.call(me)  # close: mix in checks
+        if good and self.rng.random() < EXPLORE_P:
+            # Learn how they answer sizes we have little data on.
+            seen = {b: prof["fold_sizes"][size_bucket(b / pot)][1]
+                    for b in good}
+            rare = min(good, key=lambda b: seen[b])
+            if seen[rare] < EXPLORE_MIN:
+                best_size = rare
         return self._raise_to(gs, best_size)
 
     def _facing_bet(self, gs, prof, cols, street, width, realize):
@@ -630,15 +687,16 @@ class Model:
                 return self._raise_to(gs, eff_total)
             return PlayerAction.fold(me)
 
-        if not self.pf_open[i]:
-            return PlayerAction.fold(me)
         fts = prof["fold_to_steal"]
+        if not self.pf_open[i] and not (known and fts >= WIDEN_FTS):
+            return PlayerAction.fold(me)
         frac = min(1.0, max(0.0, (fts - FTS_LOW) / (FTS_HIGH - FTS_LOW)))
         size = int(round((OPEN_MAX_X - (OPEN_MAX_X - OPEN_MIN_X) * frac)
                          * gs.big_blind))
         t = prof["three_bet"]
-        if known and t >= TIGHTEN_VS_3BET:
-            # Opening is worth it only if it survives their 3-bets.
+        # Outside the chart (they fold a lot), or against a frequent
+        # 3-bettor, open only if the open beats folding.
+        if not self.pf_open[i] or (known and t >= TIGHTEN_VS_3BET):
             f = min(fts, 1.0 - t)
             called = max(0.0, 1.0 - f - t)
             vs_3bet = max(
@@ -784,6 +842,11 @@ class Model:
                 counts.get(hit, 0), counts.get(chance, 0), mean, strength
             )
         stats["label"] = classify(stats)
+        # Raw (folds, chances) pairs: callers give the prior (`learned`).
+        stats["fold_sizes"] = [
+            (counts.get(f"fold_b{k}", 0), counts.get(f"faced_b{k}", 0))
+            for k in range(len(SIZE_EDGES) + 1)
+        ]
         return stats
 
     def opponent_teams(self, game_state: GameStateView) -> list[str]:
@@ -824,6 +887,7 @@ class Model:
         bets[sb] = game_state.small_blind
         bets[bb] = game_state.big_blind
         current = game_state.big_blind
+        pot = game_state.small_blind + game_state.big_blind
         street = 0  # 0 preflop, 1 flop, 2 turn, 3 river
         board_cards = 0
         board = []  # the board cards, in order
@@ -911,6 +975,13 @@ class Model:
                     bump(p, "faced_bet")
                     if kind == "fold":
                         bump(p, "fold_bet")
+                    owed = current - bets[p]
+                    if bets[p] == 0:  # a bet (not a raise of theirs),
+                        # sized against the pot before it
+                        key = f"b{size_bucket(owed / max(1, pot - owed))}"
+                        bump(p, "faced_" + key)
+                        if kind == "fold":
+                            bump(p, "fold_" + key)
                 if kind != "fold":
                     bump(p, "post_acts")
                     if kind == "raise":
@@ -920,8 +991,10 @@ class Model:
             if kind == "fold":
                 folded.add(p)
             elif kind == "call":
+                pot += current - bets[p]
                 bets[p] = current
             else:  # raise: amount is the new street total
+                pot += action.amount - bets[p]
                 bets[p] = action.amount
                 current = action.amount
 
@@ -942,5 +1015,10 @@ class Model:
                 continue
             counts = self.profiles.setdefault(teams[p], {})
             counts["hands"] = counts.get("hands", 0) + 1
+            for key, value in seen[p].items():
+                if key.startswith("faced_") and key[6:] in LEARNED_FOLDS:
+                    fade = FOLD_DECAY ** value  # recent answers count more
+                    for old in (key, "fold_" + key[6:]):
+                        counts[old] = counts.get(old, 0) * fade
             for key, value in seen[p].items():
                 counts[key] = counts.get(key, 0) + value
